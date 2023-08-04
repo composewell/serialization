@@ -9,34 +9,44 @@
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE TupleSections             #-}
+{-# LANGUAGE TemplateHaskell           #-}
 
 module Main where
 
-import           Codec.Serialise      as CBOR
+import Data.Word (Word8)
+-- import           Codec.Serialise      as CBOR
 import           Control.DeepSeq
 import           Criterion.Types
-import qualified Data.Binary          as B
+-- import qualified Data.Binary          as B
 import qualified Data.ByteString      as BS
 import qualified Data.ByteString.Lazy as LBS
-import qualified Data.Flat            as F
+-- import qualified Data.Flat            as F
 import           Data.List
-import qualified Data.Persist         as R
-import qualified Data.Serialize       as C
+-- import qualified Data.Persist         as R
+-- import qualified Data.Serialize       as C
 import qualified Data.Store           as S
+import qualified Streamly.Data.Serialize as SS
+import qualified Streamly.Data.Array as SS
 import qualified Data.Text            as T
 import qualified Data.Text.Encoding   as T
 import           Data.Typeable
 import           Dataset
 import           GHC.Generics
-import qualified GHC.Packing          as P
+-- import qualified GHC.Packing          as P
 import           Report
 import           System.Mem           (performMajorGC)
+
+import Streamly.External.ByteString (fromArray, toArray)
+
+import Debug.Trace
 
 -- Testing and random data generation
 import           Test.QuickCheck
 
 -- Benchmarks
 import           Criterion.Main
+
+import qualified Data.Store.TH as STH
 
 data BinTree a
   = Tree (BinTree a)
@@ -45,10 +55,14 @@ data BinTree a
   deriving (Show, Read, Eq, Typeable, Generic)
 
 -- General instances
-instance {-# OVERLAPPABLE #-} F.Flat a => F.Flat (BinTree a)
+-- instance {-# OVERLAPPABLE #-} F.Flat a => F.Flat (BinTree a)
 
 instance {-# OVERLAPPABLE #-} S.Store a => S.Store (BinTree a)
 
+-- $(STH.makeStore ''BinTree)
+$(SS.deriveSerialize ''BinTree)
+
+{-
 instance {-# OVERLAPPABLE #-} B.Binary a => B.Binary (BinTree a)
 
 instance {-# OVERLAPPABLE #-} C.Serialize a => C.Serialize (BinTree a)
@@ -57,6 +71,7 @@ instance {-# OVERLAPPABLE #-} R.Persist a => R.Persist (BinTree a)
 
 instance {-# OVERLAPPABLE #-} CBOR.Serialise a =>
                               CBOR.Serialise (BinTree a)
+-}
 
 -- -- Specialised instances, might increase performance
 -- instance {-# OVERLAPPING #-} F.Flat [Direction]
@@ -101,13 +116,16 @@ data Direction
            , Typeable
            , Generic
            , NFData
-           , B.Binary
-           , C.Serialize
-           , CBOR.Serialise
+           -- , B.Binary
+           -- , C.Serialize
+           -- , CBOR.Serialise
            , S.Store
-           , R.Persist
-           , F.Flat
+           -- , R.Persist
+           -- , F.Flat
            )
+
+--  $(STH.makeStore ''Direction)
+$(SS.deriveSerialize ''Direction)
 
 instance Arbitrary Direction where
   arbitrary = elements [North, South, Center, East, West]
@@ -172,13 +190,17 @@ data PkgFlat =
 data PkgStore =
   PkgStore
 
+data PkgStreamly =
+    PkgStreamly
+
 data PkgShow =
     PkgShow
 
 class Serialize lib a where
-  serialize :: lib -> a -> IO BS.ByteString
-  deserialize :: lib -> BS.ByteString -> IO a
+  serialize :: lib -> a -> IO (SS.Array Word8)
+  deserialize :: lib -> (SS.Array Word8) -> IO a
 
+{-
 instance (B.Binary a, NFData a) => Serialize PkgBinary a where
   {-# NOINLINE serialize #-}
   serialize _ = return . force . LBS.toStrict . B.encode
@@ -210,13 +232,19 @@ instance (CBOR.Serialise a, NFData a) => Serialize PkgCBOR a where
   serialize _ = return . force . LBS.toStrict . CBOR.serialise
   {-# NOINLINE deserialize #-}
   deserialize _ = return . force . CBOR.deserialise . LBS.fromStrict
-
+-}
 instance (S.Store a, NFData a) => Serialize PkgStore a where
   {-# NOINLINE serialize #-}
-  serialize _ = return . force . S.encode
+  serialize _ = return . force . toArray . S.encode
   {-# NOINLINE deserialize #-}
-  deserialize _ = return . force . fromRight . S.decode
+  deserialize _ = return . force . fromRight . S.decode . fromArray
 
+instance (SS.Serialize a, NFData a) => Serialize PkgStreamly a where
+  {-# NOINLINE serialize #-}
+  serialize _ = return . force . SS.pinnedEncode
+  {-# NOINLINE deserialize #-}
+  deserialize _ = return . force . SS.decode
+{-
 instance (F.Flat a, NFData a) => Serialize PkgFlat a where
   {-# NOINLINE serialize #-}
   serialize _ = return . force . F.flat
@@ -228,32 +256,34 @@ instance (Show a, Read a, NFData a) => Serialize PkgShow a where
     serialize _ = return . force .  T.encodeUtf8 . T.pack . show
     {-# NOINLINE deserialize #-}
     deserialize _ = return . force . read . T.unpack . T.decodeUtf8
-
+-}
 pkgs ::
      ( NFData a
-     , C.Serialize a
-     , Typeable a
-     , Serialise a
-     , R.Persist a
+     -- , C.Serialize a
+     -- , Typeable a
+     -- , Serialise a
+     -- , R.Persist a
      , S.Store a
-     , F.Flat a
-     , B.Binary a
+     , SS.Serialize a
+     -- , F.Flat a
+     -- , B.Binary a
      , Show a
      , Read a
      )
-  => [(String, a -> IO BS.ByteString, BS.ByteString -> IO a)]
+  => [(String, a -> IO (SS.Array Word8), (SS.Array Word8) -> IO a)]
 -- pkgs =
 --     [ ("flat-ser", serialize PkgFlat, deserialize PkgFlat)
 --      , ("store-ser", serialize PkgStore, deserialize PkgStore)]
 --   ]
 pkgs =
-  [ ("flat", serialize PkgFlat, deserialize PkgFlat)
+  [ -- ("flat", serialize PkgFlat, deserialize PkgFlat)
+   ("streamly", serialize PkgStreamly, deserialize PkgStreamly)
   , ("store", serialize PkgStore, deserialize PkgStore)
-  , ("binary", serialize PkgBinary, deserialize PkgBinary)
-  , ("cereal", serialize PkgCereal, deserialize PkgCereal)
-  , ("persist", serialize PkgPersist, deserialize PkgPersist)
-  , ("packman", serialize PkgPackman, deserialize PkgPackman)
-  , ("serialise", serialize PkgCBOR, deserialize PkgCBOR)
+  -- , ("binary", serialize PkgBinary, deserialize PkgBinary)
+  -- , ("cereal", serialize PkgCereal, deserialize PkgCereal)
+  -- , ("persist", serialize PkgPersist, deserialize PkgPersist)
+  -- , ("packman", serialize PkgPackman, deserialize PkgPackman)
+  -- , ("serialise", serialize PkgCBOR, deserialize PkgCBOR)
   -- , ("show", serialize PkgShow, deserialize PkgShow)
   ]
 
@@ -294,7 +324,7 @@ runBench
   !directionList <-
     force . ("[Direction]", ) <$>
     mapM (\_ -> generate $ arbitrary :: IO Direction) [1 .. 100000 :: Int]
-  !carsDataset <- force . ("Cars", ) <$> carsData
+  -- !carsDataset <- force . ("Cars", ) <$> carsData
     -- !abaloneDataset <- force . ("Abalone dataset",) <$> abaloneData
   let !irisDataset = force ("Iris", irisData)
 
@@ -306,7 +336,7 @@ runBench
   let tests =
         benchs directionList ++
         benchs intTree ++
-        benchs directionTree ++ benchs carsDataset ++ benchs irisDataset
+        benchs directionTree {- ++ benchs carsDataset -} ++ benchs irisDataset
   -- let tests = []
 
   defaultMainWith
@@ -320,7 +350,7 @@ runBench
   sizes directionList
   sizes directionTree
   sizes intTree
-  sizes carsDataset
+  -- sizes carsDataset
   sizes irisDataset
 
   addTransfers workDir
@@ -333,14 +363,18 @@ runBench
 
   reportMeasures workDir
 
+instance NFData (SS.Array a) where
+    rnf = const ()
+
 sizes ::
      ( Typeable t
      , NFData t
-     , B.Binary t
-     , F.Flat t
-     , Serialise t
-     , R.Persist t
-     , C.Serialize t
+     -- , B.Binary t
+     -- , F.Flat t
+     -- , Serialise t
+     -- , R.Persist t
+     -- , C.Serialize t
+     , SS.Serialize t
      , S.Store t,Show t, Read t
      )
   => (String, t)
@@ -348,7 +382,7 @@ sizes ::
 sizes (name, obj) = do
   ss <-
     mapM
-      (\(n, s, _) -> (\ss -> (n, fromIntegral . BS.length $ ss)) <$> s obj)
+      (\(n, s, _) -> (\ss -> (n, fromIntegral . SS.length $ ss)) <$> s obj)
       pkgs
   -- print ("sizes for " ++ name) >> print ss
   addMeasures workDir ("size (bytes)/" ++ name) ss
@@ -357,20 +391,24 @@ benchs ::
      ( Eq a
      , Typeable a
      , NFData a
-     , B.Binary a
-     , F.Flat a
-     , Serialise a
-     , R.Persist a
-     , C.Serialize a
+     , Show a
+     -- , B.Binary a
+     -- , F.Flat a
+     -- , Serialise a
+     -- , R.Persist a
+     -- , C.Serialize a
+     , SS.Serialize a
      , S.Store a,Read a,Show a
      )
   => (String, a)
   -> [Benchmark]
 benchs (name, obj) =
+
   let nm pkg = concat [name, "-", pkg]
                                                                           -- env (return obj) $ \sobj -> bgroup ("serialization (mSecs)") $ map (\(pkg,s,_) -> bench (nm pkg) (nfIO (s sobj))) pkgs
    in [ bgroup "serialization (time)" $
-        map (\(pkg, s, _) -> bench (nm pkg) (nfIO (BS.length <$> s obj))) pkgs
+        map (\(pkg, s, _) ->
+                 bench (nm pkg) (nfIO (SS.length <$> s obj))) pkgs
                                                                           -- NOTE: the benchmark time includes the comparison of the deserialised obj with the original
       , bgroup "deserialization (time)" $
         map
@@ -386,6 +424,29 @@ main
     -- runQC Packman
     -- runQC CBOR
  = do
+  --  print $ SS.encode $ Tree  (Leaf  (Tree  (Leaf  50)  (Leaf  (51  ::  Word8))))  (Leaf  (Tree  (Leaf  50)  (Leaf  (51  ::  Word8))))
+
+{-
+  print $ SS.encode North
+  print $ SS.encode South
+  print $ SS.encode Center
+  print $ SS.encode East
+  print $ SS.encode West
+  (print :: Direction -> IO ()) $ SS.decode $ SS.fromList [0]
+  (print :: Direction -> IO ()) $ SS.decode $ SS.fromList [1]
+  (print :: Direction -> IO ()) $ SS.decode $ SS.fromList [2]
+  (print :: Direction -> IO ()) $ SS.decode $ SS.fromList [3]
+  (print :: Direction -> IO ()) $ SS.decode $ SS.fromList [4]
+-}
+
+--  print $ SS.encode [North, South, Center, East, West]
+
+--   print $ case SS.size :: SS.Size [Direction] of
+--     SS.VarSize f -> f [North, South]
+--     SS.ConstSize sz -> sz
+
+  --  undefined
+
   runBench
     -- print $ S.encode [North, South] -- "\STX\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\SOH"
     --                                 --  "\STX\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\SOH"

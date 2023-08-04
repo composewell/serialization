@@ -1,0 +1,1 @@
+packages: ./, ../streamly/core, ../streamly-bytestring
